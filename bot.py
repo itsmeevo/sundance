@@ -3,6 +3,7 @@ import sys
 import discord
 from discord import app_commands
 from discord.ext import commands
+from discord.ui import Select, View, Modal, TextInput
 from pathlib import Path
 
 # Load environment variables
@@ -41,6 +42,7 @@ if len(token) < 50:
 # Bot setup
 intents = discord.Intents.default()
 intents.message_content = True
+intents.members = True  # Enable members intent
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 async def create_private_channel(interaction: discord.Interaction, channel_suffix: str, welcome_message: str) -> discord.TextChannel:
@@ -80,6 +82,28 @@ async def create_private_channel(interaction: discord.Interaction, channel_suffi
     
     await channel.send(welcome_message)
     return channel
+
+def update_env_file(key: str, value: str):
+    """Updates a specific key in the .env file."""
+    env_path = Path('.').resolve() / '.env'
+    lines = []
+    
+    with open(env_path, 'r') as f:
+        lines = f.readlines()
+    
+    updated = False
+    for i, line in enumerate(lines):
+        if line.startswith(f"{key}="):
+            lines[i] = f"{key}={value}\n"
+            updated = True
+            break
+    
+    if updated:
+        with open(env_path, 'w') as f:
+            f.writelines(lines)
+        os.environ[key] = value
+        return True
+    return False
 
 @bot.event
 async def on_ready():
@@ -188,6 +212,128 @@ async def cleanup(interaction: discord.Interaction):
             f"An error occurred: {str(e)}",
             ephemeral=True
         )
+
+class SettingsModal(Modal):
+    def __init__(self, setting: str, current_value: str):
+        super().__init__(title=f"Update {setting}")
+        self.setting = setting
+        
+        label = "Private Channels Category" if setting == "PRIVATE_CHANNELS_CATEGORY" else "Admin User IDs"
+        placeholder = f"Current: {current_value}"
+        
+        self.value_input = TextInput(
+            label=label,
+            placeholder=placeholder,
+            required=True
+        )
+        self.add_item(self.value_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            value = self.value_input.value.strip()
+            
+            # Validate value based on setting type
+            if self.setting == 'PRIVATE_CHANNELS_CATEGORY':
+                # Ensure value is a valid category ID
+                category = interaction.guild.get_channel(int(value))
+                if not category or not isinstance(category, discord.CategoryChannel):
+                    await interaction.response.send_message(
+                        "Invalid category ID. Please provide a valid category ID.",
+                        ephemeral=True
+                    )
+                    return
+
+            elif self.setting == 'ADMIN_USER_IDS':
+                # Validate user IDs
+                user_ids = value.split(',')
+                invalid_ids = []
+                for user_id in user_ids:
+                    try:
+                        user_id = user_id.strip()
+                        member = await interaction.guild.fetch_member(int(user_id))
+                        if not member:
+                            invalid_ids.append(user_id)
+                    except:
+                        invalid_ids.append(user_id)
+                
+                if invalid_ids:
+                    await interaction.response.send_message(
+                        f"Invalid user IDs: {', '.join(invalid_ids)}. Please provide valid user IDs.",
+                        ephemeral=True
+                    )
+                    return
+
+            # Update the setting
+            if update_env_file(self.setting, value):
+                await interaction.response.send_message(
+                    f"Successfully updated {self.setting}!",
+                    ephemeral=True
+                )
+            else:
+                await interaction.response.send_message(
+                    f"Failed to update {self.setting}. Setting not found in .env file.",
+                    ephemeral=True
+                )
+
+        except ValueError as e:
+            await interaction.response.send_message(
+                f"Invalid value format: {str(e)}",
+                ephemeral=True
+            )
+        except Exception as e:
+            await interaction.response.send_message(
+                f"An error occurred: {str(e)}",
+                ephemeral=True
+            )
+
+class SettingsView(View):
+    def __init__(self):
+        super().__init__()
+        self.add_item(SettingsSelect())
+
+class SettingsSelect(Select):
+    def __init__(self):
+        options = [
+            discord.SelectOption(
+                label="Private Channels Category",
+                description="Set the category for private channels",
+                value="PRIVATE_CHANNELS_CATEGORY"
+            ),
+            discord.SelectOption(
+                label="Admin User IDs",
+                description="Set the admin users who get notified",
+                value="ADMIN_USER_IDS"
+            )
+        ]
+        super().__init__(
+            placeholder="Choose a setting to update...",
+            options=options
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        setting = self.values[0]
+        current_value = os.getenv(setting, "Not set")
+        modal = SettingsModal(setting, current_value)
+        await interaction.response.send_modal(modal)
+
+@bot.tree.command(name="settings", description="Update bot settings (Admin only)")
+async def settings(interaction: discord.Interaction):
+    """Updates specific bot settings using an interactive menu. Only available to administrators."""
+    # Check if user has administrator permissions
+    member = interaction.guild.get_member(interaction.user.id)
+    if not member.guild_permissions.administrator:
+        await interaction.response.send_message(
+            "This command requires administrator permissions!",
+            ephemeral=True
+        )
+        return
+
+    view = SettingsView()
+    await interaction.response.send_message(
+        "Please select a setting to update:",
+        view=view,
+        ephemeral=True
+    )
 
 # Run the bot
 bot.run(token)
