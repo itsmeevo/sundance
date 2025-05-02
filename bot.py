@@ -218,12 +218,17 @@ class SettingsModal(Modal):
         super().__init__(title=f"Update {setting}")
         self.setting = setting
         
-        label = "Private Channels Category" if setting == "PRIVATE_CHANNELS_CATEGORY" else "Admin User IDs"
-        placeholder = f"Current: {current_value}"
+        placeholder = "Category ID" if setting == "PRIVATE_CHANNELS_CATEGORY" else "Comma-separated user IDs"
+        label_text = (
+            "Enter category ID for private channels" 
+            if setting == "PRIVATE_CHANNELS_CATEGORY" 
+            else "Enter admin user IDs (comma-separated)"
+        )
         
         self.value_input = TextInput(
-            label=label,
+            label=label_text,
             placeholder=placeholder,
+            default=current_value,
             required=True
         )
         self.add_item(self.value_input)
