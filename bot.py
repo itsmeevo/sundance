@@ -161,22 +161,26 @@ async def check_bluesky_feed():
             print(f"Found DID: {did}")
             
             print("Fetching feed...")
-            feed_response = await asyncio.to_thread(
-                client.app.bsky.feed.get_author_feed,
-                {
-                    "actor": "destiny2team.bungie.net",
-                    "limit": 1 if not configs[0].last_bluesky_post else 10
-                }
-            )
-            
-            posts = feed_response.feed
-            print(f"Found {len(posts)} posts")
-            
             for config in configs:
                 # Get fresh config data within this session
                 stmt = select(GuildConfig).where(GuildConfig.id == config.id)
                 result = await session.execute(stmt)
                 config = result.scalar_one()
+                
+                # Determine if this is first run for this guild
+                is_first_run = not config.last_bluesky_post
+                
+                # Get either 1 post (first run) or up to 10 posts (subsequent runs)
+                feed_response = await asyncio.to_thread(
+                    client.app.bsky.feed.get_author_feed,
+                    {
+                        "actor": "destiny2team.bungie.net",
+                        "limit": 1 if is_first_run else 10
+                    }
+                )
+                
+                posts = feed_response.feed
+                print(f"Found {len(posts)} posts")
                 
                 channel = bot.get_channel(config.bluesky_channel_id)
                 if not channel:
@@ -188,6 +192,8 @@ async def check_bluesky_feed():
                 print(f"Last post time: {last_post_time}")
                 
                 new_posts = 0
+                newest_post_time = None
+                
                 for post in posts:
                     try:
                         # Access fields directly from the record
@@ -203,6 +209,8 @@ async def check_bluesky_feed():
                         
                         if post_dt > last_post_dt:
                             new_posts += 1
+                            newest_post_time = post_time  # Track the newest post we've sent
+                            
                             # Create embed for the post
                             embed = discord.Embed(
                                 title="Link to Post",
@@ -224,15 +232,12 @@ async def check_bluesky_feed():
                 
                 print(f"Sent {new_posts} new posts")
                 
-                # Update the last post time for this guild
-                if posts:
+                # Only update the last post time if we actually sent new posts
+                if new_posts > 0 and newest_post_time:
                     try:
-                        latest_post = posts[0]
-                        latest_time = latest_post.post.record.created_at
-                        if latest_time:
-                            config.last_bluesky_post = latest_time
-                            await session.commit()
-                            print(f"Updated last post time to {latest_time}")
+                        config.last_bluesky_post = newest_post_time
+                        await session.commit()
+                        print(f"Updated last post time to {newest_post_time}")
                     except Exception as e:
                         print(f"Error updating last post time: {e}")
                         traceback.print_exc()
@@ -674,23 +679,23 @@ class SettingsSelect(Select):
         self.guild_id = guild_id
         options = [
             discord.SelectOption(
-                label="Private Channels Category",
+                label="Set Category",
                 description="Category for private channels",
                 value="PRIVATE_CHANNELS_CATEGORY"
             ),
             discord.SelectOption(
-                label="Admin Usernames",
+                label="Set Admins",
                 description="Admins to notify",
                 value="ADMIN_USERNAMES"
             ),
             discord.SelectOption(
-                label="D2 Updates Channel",
-                description="Channel for Bluesky updates",
+                label="Set D2 Channel",
+                description="Channel for updates",
                 value="BLUESKY_CHANNEL"
             ),
             discord.SelectOption(
-                label="D2 Updates Toggle",
-                description="Enable/disable Bluesky feed",
+                label="Toggle D2 Feed",
+                description="Enable/disable feed",
                 value="BLUESKY_ENABLED"
             )
         ]
@@ -700,29 +705,58 @@ class SettingsSelect(Select):
         )
 
     async def callback(self, interaction: discord.Interaction):
-        setting = self.values[0]
-        config = await get_guild_config(self.guild_id)
-        
-        current_value = ""
-        if setting == 'PRIVATE_CHANNELS_CATEGORY' and config.private_channels_category:
-            current_value = str(config.private_channels_category)
-        elif setting == 'ADMIN_USERNAMES' and config.admin_usernames:
-            current_value = config.admin_usernames
-        elif setting == 'BLUESKY_CHANNEL' and config.bluesky_channel_id:
-            current_value = str(config.bluesky_channel_id)
-        elif setting == 'BLUESKY_ENABLED':
-            current_value = str(config.bluesky_enabled)
+        try:
+            setting = self.values[0]
+            config = await get_guild_config(self.guild_id)
             
-        if setting == 'BLUESKY_ENABLED':
-            view = BlueskyToggleView(self.guild_id, bool(config.bluesky_enabled))
-            await interaction.response.send_message(
-                "Toggle Bluesky Feed:",
-                view=view,
-                ephemeral=True
-            )
-        else:
-            modal = SettingsModal(setting, current_value, self.guild_id)
-            await interaction.response.send_modal(modal)
+            current_value = ""
+            if setting == 'PRIVATE_CHANNELS_CATEGORY' and config.private_channels_category:
+                current_value = str(config.private_channels_category)
+            elif setting == 'ADMIN_USERNAMES' and config.admin_usernames:
+                current_value = config.admin_usernames
+            elif setting == 'BLUESKY_CHANNEL' and config.bluesky_channel_id:
+                current_value = str(config.bluesky_channel_id)
+            elif setting == 'BLUESKY_ENABLED':
+                current_value = str(config.bluesky_enabled)
+                
+            if setting == 'BLUESKY_ENABLED':
+                view = BlueskyToggleView(self.guild_id, bool(config.bluesky_enabled))
+                try:
+                    await interaction.response.send_message(
+                        "Toggle Bluesky Feed:",
+                        view=view,
+                        ephemeral=True
+                    )
+                except discord.errors.NotFound:
+                    await interaction.followup.send(
+                        "Toggle Bluesky Feed:",
+                        view=view,
+                        ephemeral=True
+                    )
+            else:
+                modal = SettingsModal(setting, current_value, self.guild_id)
+                try:
+                    await interaction.response.send_modal(modal)
+                except discord.errors.NotFound:
+                    # If the interaction expires, we can't show a modal
+                    # Instead, create a new message with buttons
+                    await interaction.followup.send(
+                        f"The interaction timed out. Please try using the settings command again.",
+                        ephemeral=True
+                    )
+        except Exception as e:
+            print(f"Error in settings select callback: {e}")
+            traceback.print_exc()
+            try:
+                await interaction.response.send_message(
+                    "An error occurred. Please try again.",
+                    ephemeral=True
+                )
+            except discord.errors.NotFound:
+                await interaction.followup.send(
+                    "An error occurred. Please try again.",
+                    ephemeral=True
+                )
 
 class BlueskyToggleView(View):
     def __init__(self, guild_id: int, current_state: bool):
@@ -751,41 +785,53 @@ class BlueskyToggleButton(discord.ui.Button):
 @app_commands.default_permissions(administrator=True)
 async def settings(interaction: discord.Interaction):
     """Updates specific bot settings using an interactive menu. Only available to administrators."""
-    async with AsyncSession(engine) as session:
-        # Get current config
-        stmt = select(GuildConfig).where(GuildConfig.guild_id == interaction.guild_id)
-        result = await session.execute(stmt)
-        config = result.scalar_one_or_none()
-        
-        if not config:
-            config = GuildConfig(guild_id=interaction.guild_id)
-            session.add(config)
-            await session.commit()
+    try:
+        # Get current config without deferring first
+        config = await get_guild_config(interaction.guild_id)
         
         # Check if this is initial setup
         is_initial_setup = not config.private_channels_category and not config.admin_usernames
         
         if is_initial_setup:
             setup_message = (
-                "🔧 Initial Setup\n\n"
+                "🔧 **Initial Setup**\n\n"
                 "To complete setup:\n"
-                "1. Create a category for private channels if you haven't already\n"
-                "2. Select 'Private Channels Category' and enter the category ID\n"
-                "3. Select 'Admin Usernames' and enter the usernames who should be notified\n\n"
-                "Need the category ID? Right-click the category and select 'Copy ID'.\n"
-                "For admin usernames, you can use either format:\n"
-                "• username (e.g., \"meevo.\")\n"
-                "• username#discriminator (e.g., \"meevo#1234\")"
+                "1. Create a category for private channels\n"
+                "2. Set the category using 'Set Category'\n"
+                "3. Set admin users using 'Set Admins'\n\n"
+                "**Need help?**\n"
+                "• To get a category/channel ID, right-click it and select 'Copy ID'\n"
+                "• Admin usernames can be 'username' or 'username#1234'"
             )
         else:
-            setup_message = "Sure, what do you want to change?"
+            setup_message = "Sure, what would you like to change?"
 
         view = SettingsView(interaction.guild_id)
-        await interaction.response.send_message(
-            setup_message,
-            view=view,
-            ephemeral=True
-        )
+        try:
+            await interaction.response.send_message(
+                setup_message,
+                view=view,
+                ephemeral=True
+            )
+        except discord.errors.NotFound:
+            await interaction.followup.send(
+                setup_message,
+                view=view,
+                ephemeral=True
+            )
+    except Exception as e:
+        print(f"Error in settings command: {e}")
+        traceback.print_exc()
+        try:
+            await interaction.response.send_message(
+                "An error occurred. Please try again.",
+                ephemeral=True
+            )
+        except discord.errors.NotFound:
+            await interaction.followup.send(
+                "An error occurred. Please try again.",
+                ephemeral=True
+            )
 
 # Run the bot
 bot.run(token)
