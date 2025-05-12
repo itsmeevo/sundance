@@ -136,19 +136,19 @@ async def check_bluesky_feed():
     else:
         print("No Bluesky credentials provided - some features may be limited")
     
-    async with AsyncSession(engine) as session:
-        # Get all guilds with Bluesky enabled
-        stmt = select(GuildConfig).where(GuildConfig.bluesky_enabled == 1)
-        result = await session.execute(stmt)
-        configs = result.scalars().all()
-        
-        print(f"Found {len(configs)} guilds with Bluesky enabled")
-        
-        if not configs:
-            return
+    try:
+        async with AsyncSession(engine) as session:
+            # Get all guilds with Bluesky enabled
+            stmt = select(GuildConfig).where(GuildConfig.bluesky_enabled == 1)
+            result = await session.execute(stmt)
+            configs = result.scalars().all()
             
-        # Get latest posts from Destiny 2 team
-        try:
+            print(f"Found {len(configs)} guilds with Bluesky enabled")
+            
+            if not configs:
+                return
+                
+            # Get latest posts from Destiny 2 team
             print("Fetching Destiny 2 team profile...")
             profile_response = await asyncio.to_thread(
                 client.get_profile,
@@ -173,6 +173,11 @@ async def check_bluesky_feed():
             print(f"Found {len(posts)} posts")
             
             for config in configs:
+                # Get fresh config data within this session
+                stmt = select(GuildConfig).where(GuildConfig.id == config.id)
+                result = await session.execute(stmt)
+                config = result.scalar_one()
+                
                 channel = bot.get_channel(config.bluesky_channel_id)
                 if not channel:
                     print(f"Could not find channel {config.bluesky_channel_id}")
@@ -232,9 +237,9 @@ async def check_bluesky_feed():
                         print(f"Error updating last post time: {e}")
                         traceback.print_exc()
                     
-        except Exception as e:
-            print(f"Error checking Bluesky feed: {e}")
-            traceback.print_exc()
+    except Exception as e:
+        print(f"Error checking Bluesky feed: {e}")
+        traceback.print_exc()
 
 @tasks.loop(minutes=5)
 async def bluesky_feed_task():
