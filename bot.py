@@ -148,7 +148,7 @@ async def check_bluesky_feed():
             if not configs:
                 return
                 
-            # Get latest posts from Destiny 2 team
+            # Get latest posts from Destiny 2 team once
             print("Fetching Destiny 2 team profile...")
             profile_response = await asyncio.to_thread(
                 client.get_profile,
@@ -160,61 +160,70 @@ async def check_bluesky_feed():
             avatar_url = profile_response.avatar or "https://www.bungie.net/img/destiny_content/icons/icon_destiny.png"
             print(f"Found DID: {did}")
             
+            # Determine if this is first run for any guild
+            any_first_run = any(not config.last_bluesky_post for config in configs)
+            
+            # Get either 1 post (if any guild is on first run) or up to 10 posts
             print("Fetching feed...")
+            feed_response = await asyncio.to_thread(
+                client.app.bsky.feed.get_author_feed,
+                {
+                    "actor": "destiny2team.bungie.net",
+                    "limit": 1 if any_first_run else 10
+                }
+            )
+            
+            posts = feed_response.feed
+            print(f"Found {len(posts)} posts")
+            
+            # Sort posts by timestamp (oldest first)
+            sorted_posts = sorted(posts, key=lambda p: p.post.record.created_at)
+            
+            # Process posts for each guild
             for config in configs:
-                # Get fresh config data within this session
-                stmt = select(GuildConfig).where(GuildConfig.id == config.id)
-                result = await session.execute(stmt)
-                config = result.scalar_one()
-                
-                # Determine if this is first run for this guild
-                is_first_run = not config.last_bluesky_post
-                
-                # Get either 1 post (first run) or up to 10 posts (subsequent runs)
-                feed_response = await asyncio.to_thread(
-                    client.app.bsky.feed.get_author_feed,
-                    {
-                        "actor": "destiny2team.bungie.net",
-                        "limit": 1 if is_first_run else 10
-                    }
-                )
-                
-                posts = feed_response.feed
-                print(f"Found {len(posts)} posts")
-                
-                channel = bot.get_channel(config.bluesky_channel_id)
-                if not channel:
-                    print(f"Could not find channel {config.bluesky_channel_id}")
-                    continue
+                try:
+                    channel = bot.get_channel(config.bluesky_channel_id)
+                    if not channel:
+                        print(f"Could not find channel {config.bluesky_channel_id}")
+                        continue
+                        
+                    last_post_time = config.last_bluesky_post or "1970-01-01T00:00:00Z"
+                    last_post_dt = datetime.fromisoformat(last_post_time.replace('Z', '+00:00'))
+                    guild_id = config.guild_id  # Store guild_id before any async operations
+                    print(f"Last post time for guild {guild_id}: {last_post_time}")
                     
-                last_post_time = config.last_bluesky_post or "1970-01-01T00:00:00Z"
-                last_post_dt = datetime.fromisoformat(last_post_time.replace('Z', '+00:00'))
-                print(f"Last post time: {last_post_time}")
-                
-                new_posts = 0
-                newest_post_time = None
-                
-                for post in posts:
-                    try:
-                        # Access fields directly from the record
-                        post_text = post.post.record.text
-                        post_time = post.post.record.created_at
-                        
-                        if not post_time:
-                            print(f"Warning: No timestamp found for post")
+                    new_posts = []  # Track all new posts before sending
+                    
+                    # First pass: collect all new posts
+                    for post in sorted_posts:
+                        try:
+                            post_text = post.post.record.text
+                            post_time = post.post.record.created_at
+                            
+                            if not post_time:
+                                print(f"Warning: No timestamp found for post")
+                                continue
+                                
+                            post_dt = datetime.fromisoformat(post_time.replace('Z', '+00:00'))
+                            print(f"Checking post from {post_time}")
+                            
+                            if post_dt > last_post_dt:
+                                new_posts.append((post, post_dt, post_time))
+                        except Exception as e:
+                            print(f"Error processing post: {e}")
+                            traceback.print_exc()
                             continue
-                            
-                        post_dt = datetime.fromisoformat(post_time.replace('Z', '+00:00'))
-                        print(f"Checking post from {post_time}")
-                        
-                        if post_dt > last_post_dt:
-                            new_posts += 1
-                            newest_post_time = post_time  # Track the newest post we've sent
-                            
-                            # Create embed for the post
+                    
+                    # If this is first run, only take the most recent post
+                    if not config.last_bluesky_post and new_posts:
+                        new_posts = [new_posts[-1]]  # Keep only the newest post
+                    
+                    # Second pass: send posts in chronological order
+                    for post, post_dt, post_time in new_posts:
+                        try:
                             embed = discord.Embed(
                                 title="Link to Post",
-                                description=post_text,
+                                description=post.post.record.text,
                                 color=0x00b0f4,
                                 url=f"https://bsky.app/profile/destiny2team.bungie.net/post/{post.post.uri.split('/')[-1]}"
                             )
@@ -225,22 +234,28 @@ async def check_bluesky_feed():
                             embed.timestamp = post_dt
                             
                             await channel.send(embed=embed)
-                    except Exception as e:
-                        print(f"Error processing post: {e}")
-                        traceback.print_exc()
-                        continue
-                
-                print(f"Sent {new_posts} new posts")
-                
-                # Only update the last post time if we actually sent new posts
-                if new_posts > 0 and newest_post_time:
-                    try:
-                        config.last_bluesky_post = newest_post_time
-                        await session.commit()
-                        print(f"Updated last post time to {newest_post_time}")
-                    except Exception as e:
-                        print(f"Error updating last post time: {e}")
-                        traceback.print_exc()
+                        except Exception as e:
+                            print(f"Error sending post: {e}")
+                            traceback.print_exc()
+                            continue
+                    
+                    print(f"Sent {len(new_posts)} new posts to guild {guild_id}")
+                    
+                    # Update the last post time to the newest post we've processed
+                    if new_posts:
+                        try:
+                            newest_post = new_posts[-1]  # Get the last post (newest)
+                            config.last_bluesky_post = newest_post[2]  # post_time
+                            await session.commit()
+                            print(f"Updated last post time to {newest_post[2]} for guild {guild_id}")
+                        except Exception as e:
+                            print(f"Error updating last post time: {e}")
+                            traceback.print_exc()
+                            
+                except Exception as e:
+                    print(f"Error processing guild {guild_id}: {e}")
+                    traceback.print_exc()
+                    continue
                     
     except Exception as e:
         print(f"Error checking Bluesky feed: {e}")
